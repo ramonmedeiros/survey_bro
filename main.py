@@ -1,131 +1,111 @@
-from agents.voice import TTSModelSettings, VoicePipeline, VoicePipelineConfig, SingleAgentVoiceWorkflow, AudioInput
 import sounddevice as sd
 import numpy as np
 import asyncio
+import os
 
-from agents import Agent, function_tool, WebSearchTool, FileSearchTool, set_default_openai_key
-from agents.extensions.handoff_prompt import prompt_with_handoff_instructions
+from typing import Any
+from agents.voice import VoicePipeline, SingleAgentVoiceWorkflow, AudioInput
+from agents import trace, set_default_openai_client, add_trace_processor
+from agents.tracing.processors import TracingExporter, BatchTraceProcessor
+from agents.tracing.spans import Span
+from agents.tracing.traces import Trace
 
-set_default_openai_key("YOUR_API_KEY")
+from openai import AsyncAzureOpenAI
+from stt_agent import stt_model
+from tts_agent import tts_model
+from main_agent import main_agent
 
-@function_tool
-def get_account_info(user_id: str) -> dict:
-    """Return dummy account info for a given user."""
-    return {
-        "user_id": user_id,
-        "name": "Bugs Bunny",
-        "account_balance": "£72.50",
-        "membership_status": "Gold Executive"
-    }
 
+class ConsoleSpanExporter(TracingExporter):
+    """Prints the traces and spans to the console."""
+
+    def export(self, items: list[Trace | Span[Any]]) -> None:
+        for item in items:
+            if isinstance(item, Trace):
+                print(
+                    f"[Exporter] Export trace_id={item.trace_id}, name={item.name}, ")
+            elif isinstance(item, Span):
+                pass
+
+# Set the default OpenAI client for the Agents SDK
+set_default_openai_client(AsyncAzureOpenAI(
+    api_key=os.getenv("AZURE_OPENAI_API_KEY"),
+    api_version=os.getenv("AZURE_OPENAI_API_VERSION"),
+    azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
+))
+
+# Set up console tracing
+console_exporter = ConsoleSpanExporter()
+console_processor = BatchTraceProcessor(exporter=console_exporter)
+add_trace_processor(console_processor)
+
+
+# Settings
+sample_rate = 44100
+block_size = 1024
+channels = 1
+dtype = 'float32'
+silence_threshold = 0.01  # Volume below this is considered silence
+silence_duration = 2.0  # Seconds of silence before stopping
+
+audio_data = []
+silent_blocks = 0
+max_silent_blocks = int((silence_duration * sample_rate) / block_size)
+
+def callback(indata, frames, time_info, status):
+    global silent_blocks, audio_data
+
+    volume_norm = np.linalg.norm(indata)
+    audio_data.append(indata.copy())
+
+    if volume_norm < silence_threshold:
+        silent_blocks += 1
+    else:
+        silent_blocks = 0  # Reset on noise
+
+    if silent_blocks >= max_silent_blocks:
+        raise sd.CallbackStop()
 
 # Common system prompt for voice output best practices:
-voice_system_prompt = """
-[Output Structure]
-Your output will be delivered in an audio voice response, please ensure that every response meets these guidelines:
-1. Use a friendly, human tone that will sound natural when spoken aloud.
-2. Keep responses short and segmented—ideally one to two concise sentences per step.
-3. Avoid technical jargon; use plain language so that instructions are easy to understand.
-4. Provide only essential details so as not to overwhelm the listener.
-"""
+async def main():
+    devices = sd.query_devices(kind='input')
+    samplerate = devices['default_samplerate']
 
-# --- Agent: Search Agent ---
-search_voice_agent = Agent(
-    name="SearchVoiceAgent",
-    instructions=voice_system_prompt + (
-        "You immediately provide an input to the WebSearchTool to find up-to-date information on the user's query."
-    ),
-    tools=[WebSearchTool()],
-)
-
-# --- Agent: Knowledge Agent ---
-knowledge_voice_agent = Agent(
-    name="KnowledgeVoiceAgent",
-    instructions=voice_system_prompt + (
-        "You answer user questions on our product portfolio with concise, helpful responses using the FileSearchTool."
-    ),
-    tools=[FileSearchTool(
-            max_num_results=3,
-            vector_store_ids=["VECTOR_STORE_ID"],
-        ),],
-)
-
-# --- Agent: Account Agent ---
-account_voice_agent = Agent(
-    name="AccountVoiceAgent",
-    instructions=voice_system_prompt + (
-        "You provide account information based on a user ID using the get_account_info tool."
-    ),
-    tools=[get_account_info],
-)
-
-# --- Agent: Triage Agent ---
-triage_voice_agent = Agent(
-    name="VoiceAssistant",
-    instructions=prompt_with_handoff_instructions("""
-You are the virtual assistant for Acme Shop. Welcome the user and ask how you can help.
-Based on the user's intent, route to:
-- AccountAgent for account-related queries
-- KnowledgeAgent for product FAQs
-- SearchAgent for anything requiring real-time web search
-"""),
-    handoffs=[account_voice_agent, knowledge_voice_agent, search_voice_agent],
-)
-
-# Define custom TTS model settings with the desired instructions
-custom_tts_settings = TTSModelSettings(
-    instructions="Personality: upbeat, friendly, persuasive guide"
-    "Tone: Friendly, clear, and reassuring, creating a calm atmosphere and making the listener feel confident and comfortable."
-    "Pronunciation: Clear, articulate, and steady, ensuring each instruction is easily understood while maintaining a natural, conversational flow."
-    "Tempo: Speak relatively fast, include brief pauses and after before questions"
-    "Emotion: Warm and supportive, conveying empathy and care, ensuring the listener feels guided and safe throughout the journey."
-)
-
-async def voice_assistant_optimized():
-    samplerate = sd.query_devices(kind='input')['default_samplerate']
-    voice_pipeline_config = VoicePipelineConfig(tts_settings=custom_tts_settings)
+    pipeline = VoicePipeline(
+                stt_model=stt_model,
+                tts_model=tts_model,
+                workflow=SingleAgentVoiceWorkflow(main_agent),
+            )
 
     while True:
-        pipeline = VoicePipeline(workflow=SingleAgentVoiceWorkflow(triage_voice_agent), config=voice_pipeline_config)
-
-        # Check for input to either provide voice or exit
-        cmd = input("Press Enter to speak your query (or type 'esc' to exit): ")
-        if cmd.lower() == "esc":
-            print("Exiting...")
-            break       
-        print("Listening...")
-        recorded_chunks = []
-
-         # Start streaming from microphone until Enter is pressed
-        with sd.InputStream(samplerate=samplerate, channels=1, dtype='int16', callback=lambda indata, frames, time, status: recorded_chunks.append(indata.copy())):
-            input()
+        with sd.InputStream(samplerate=samplerate, channels=1, dtype='int16', callback=callback):
+            try:
+                sd.sleep(int(5 * 1000))  # Max 5 seconds
+            except sd.CallbackStop:
+                pass
 
         # Concatenate chunks into single buffer
-        recording = np.concatenate(recorded_chunks, axis=0)
+        recording = np.concatenate(audio_data, axis=0)
 
         # Input the buffer and await the result
         audio_input = AudioInput(buffer=recording)
 
-        with trace("ACME App Optimized Voice Assistant"):
+        with trace("ACME App Voice Assistant"):
             result = await pipeline.run(audio_input)
 
-         # Transfer the streamed result into chunks of audio
-        response_chunks = []
-        async for event in result.stream():
-            if event.type == "voice_stream_event_audio":
-                response_chunks.append(event.data)
+            # Play the audio stream as it comes in
+            response_chunks = []
+            async for event in result.stream():
+                match event.type:
+                    case "voice_stream_event_audio":
+                        response_chunks.append(event.data)
+                    case "voice_stream_event_lifecycle":
+                        print(f"lifecycle: {event}")
+                    case "voice_stream_event_error":
+                        print(f"error: {event}")
         response_audio = np.concatenate(response_chunks, axis=0)
-
-        # Play response
-        print("Assistant is responding...")
-        sd.play(response_audio, samplerate=samplerate)
+        sd.play(response_audio, samplerate=samplerate/2)
         sd.wait()
-        print("---")
-
-def main():
-    # Run the voice assistant
-    asyncio.run(voice_assistant_optimized())
 
 if __name__ == "__main__":
-    main()
-
+    asyncio.run(main())
